@@ -1,0 +1,16 @@
+{
+  "name": "secure-admin-panel",
+  "version": "1.0.0",
+  "description": "Server-side auth that cannot be bypassed client-side",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "express-session": "^1.17.3",
+    "helmet": "^7.1.0"
+  }
+}
