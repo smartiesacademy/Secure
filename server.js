@@ -11,17 +11,13 @@ const PORT = process.env.PORT || 3000;
 const SALT_ROUNDS = 13;
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(64).toString('hex');
 
-// === IN-MEMORY DATABASE ===
-// Resets on server sleep — fine for CTF/demo. For production use Redis.
 const db = {
-    admin: null,           // { username, hash, createdAt }
-    csrfTokens: new Map(), // token -> { expires, sessionId }
-    failedAttempts: new Map(), // ip -> [{ timestamp }]
+    admin: null,
+    csrfTokens: new Map(),
+    failedAttempts: new Map(),
     bannedIPs: new Set(),
-    honeypotTriggers: new Map(), // ip -> count
 };
 
-// === MIDDLEWARE ===
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
@@ -39,29 +35,25 @@ app.use(helmet({
     },
     hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
     referrerPolicy: { policy: 'same-origin' },
-    crossOriginEmbedderPolicy: false, // free tier compatibility
 }));
 
 app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: false, limit: '10kb' }));
-app.use(express.static('public'));
 
 app.use(session({
-    name: '__Host-admin_sid',          // __Host- prefix requires Secure + Path=/
+    name: '__Host-admin_sid',
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
-    rolling: true,                     // Reset maxAge on every request
+    rolling: true,
     cookie: {
-        secure: false,                 // Set to true if behind HTTPS (Render does this)
-        httpOnly: true,                // Inaccessible to JavaScript
-        maxAge: 15 * 60 * 1000,        // 15 minutes
-        sameSite: 'strict',            // CSRF protection via cookie isolation
+        secure: false,
+        httpOnly: true,
+        maxAge: 15 * 60 * 1000,
+        sameSite: 'strict',
         path: '/',
     }
 }));
-
-// === SECURITY HELPERS ===
 
 function getClientIP(req) {
     return req.headers['x-forwarded-for']?.split(',')[0].trim() 
@@ -81,14 +73,12 @@ function recordFailedAttempt(ip) {
     attempts.push(now);
     db.failedAttempts.set(ip, attempts);
 
-    // Progressive ban: 5 fails = 1hr ban, 10 = permanent (until restart)
     if (attempts.length >= 10) {
         db.bannedIPs.add(ip);
         return { banned: true, duration: 'permanent' };
     } else if (attempts.length >= 5) {
-        const release = now + 3600000;
-        setTimeout(() => db.bannedIPs.delete(ip), 3600000);
         db.bannedIPs.add(ip);
+        setTimeout(() => db.bannedIPs.delete(ip), 3600000);
         return { banned: true, duration: 3600000 };
     }
     return { banned: false, remaining: 5 - attempts.length };
@@ -100,18 +90,6 @@ function generateCSRF(sessionId) {
     return token;
 }
 
-function validateCSRF(req, res, next) {
-    const token = req.headers['x-csrf-token'] || req.body?.csrfToken;
-    const entry = db.csrfTokens.get(token);
-    if (!entry || entry.expires < Date.now() || entry.sessionId !== req.sessionID) {
-        return res.status(403).json({ error: 'Invalid or expired CSRF token' });
-    }
-    // Single-use token
-    db.csrfTokens.delete(token);
-    next();
-}
-
-// === RATE LIMITERS ===
 const strictLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 5,
@@ -125,13 +103,12 @@ const strictLimiter = rateLimit({
 
 const generalLimiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 20,
+    max: 30,
     keyGenerator: (req) => getClientIP(req),
 });
 
 app.use(generalLimiter);
 
-// === AUTH MIDDLEWARE ===
 function requireAuth(req, res, next) {
     if (req.session?.authenticated === true && req.session?.username) {
         return next();
@@ -146,14 +123,9 @@ function requireNoAuth(req, res, next) {
     next();
 }
 
-// === HONEYPOT ===
-// Fake "backdoor" endpoint that logs and bans attackers
 app.all('/admin/backup/config.bak', (req, res) => {
-    const ip = getClientIP(req);
-    const count = (db.honeypotTriggers.get(ip) || 0) + 1;
-    db.honeypotTriggers.set(ip, count);
-    if (count >= 2) db.bannedIPs.add(ip);
-    res.status(200).send('<!-- nothing here -->');
+    db.bannedIPs.add(getClientIP(req));
+    res.status(200).send('<!-- nothing -->');
 });
 
 app.all('/.env', (req, res) => {
@@ -161,13 +133,10 @@ app.all('/.env', (req, res) => {
     res.status(404).send('Not Found');
 });
 
-// === API ROUTES ===
-
 app.get('/api/status', (req, res) => {
     res.json({
         setupRequired: !db.admin,
         authenticated: !!req.session?.authenticated,
-        ip: getClientIP(req)  // debug, remove in production
     });
 });
 
@@ -179,7 +148,6 @@ app.get('/api/csrf', (req, res) => {
 app.post('/api/setup', strictLimiter, requireNoAuth, async (req, res) => {
     const ip = getClientIP(req);
     if (isIPBanned(ip)) return res.status(403).json({ error: 'Banned' });
-
     if (db.admin) return res.status(403).json({ error: 'Already initialized' });
 
     const { username, password, csrfToken } = req.body;
@@ -187,7 +155,6 @@ app.post('/api/setup', strictLimiter, requireNoAuth, async (req, res) => {
         return res.status(400).json({ error: 'Username required, password min 8 chars' });
     }
 
-    // Validate CSRF for setup too
     const entry = db.csrfTokens.get(csrfToken);
     if (!entry || entry.expires < Date.now() || entry.sessionId !== req.sessionID) {
         return res.status(403).json({ error: 'Invalid CSRF' });
@@ -207,7 +174,6 @@ app.post('/api/setup', strictLimiter, requireNoAuth, async (req, res) => {
 app.post('/api/login', strictLimiter, async (req, res) => {
     const ip = getClientIP(req);
     if (isIPBanned(ip)) return res.status(403).json({ error: 'IP banned' });
-
     if (!db.admin) return res.status(400).json({ error: 'Not initialized' });
 
     const { username, password, csrfToken } = req.body;
@@ -235,10 +201,9 @@ app.post('/api/login', strictLimiter, async (req, res) => {
         return res.status(401).json({ error: 'Invalid credentials', remaining: status.remaining });
     }
 
-    // Clear failed attempts on success
     db.failedAttempts.delete(ip);
 
-    req.session.regenerate((err) => {  // Prevent session fixation
+    req.session.regenerate((err) => {
         if (err) return res.status(500).json({ error: 'Session error' });
         req.session.authenticated = true;
         req.session.username = username;
@@ -271,12 +236,12 @@ app.get('/api/admin/data', requireAuth, (req, res) => {
     });
 });
 
-// SPA fallback
+app.use(express.static(path.join(__dirname, 'public')));
 app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 app.listen(PORT, () => {
-    console.log(`🔒 Secure Admin Panel v2 running on port ${PORT}`);
+    console.log(`🔒 Secure Admin Panel v3 running on port ${PORT}`);
     console.log(`Setup required: ${!db.admin}`);
 });
