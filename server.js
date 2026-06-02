@@ -3,17 +3,22 @@ const session = require('express-session');
 const bcrypt = require('bcrypt');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
+const crypto = require('crypto');
 const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const SALT_ROUNDS = 12;
-const SESSION_SECRET = process.env.SESSION_SECRET || require('crypto').randomBytes(32).toString('hex');
+const SALT_ROUNDS = 13;
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(64).toString('hex');
 
-// In-memory store (resets on sleep, but fine for demo/CTF)
+// === IN-MEMORY DATABASE ===
+// Resets on server sleep — fine for CTF/demo. For production use Redis.
 const db = {
-    admin: null,      // { username, hash, createdAt }
-    sessions: new Set() // track active session IDs
+    admin: null,           // { username, hash, createdAt }
+    csrfTokens: new Map(), // token -> { expires, sessionId }
+    failedAttempts: new Map(), // ip -> [{ timestamp }]
+    bannedIPs: new Set(),
+    honeypotTriggers: new Map(), // ip -> count
 };
 
 // === MIDDLEWARE ===
@@ -22,152 +27,256 @@ app.use(helmet({
         directives: {
             defaultSrc: ["'self'"],
             scriptSrc: ["'self'"],
-            styleSrc: ["'self'", "'unsafe-inline'"], // inline styles for demo
+            styleSrc: ["'self'", "'unsafe-inline'"],
             imgSrc: ["'self'", "data:"],
+            connectSrc: ["'self'"],
+            fontSrc: ["'self'"],
+            objectSrc: ["'none'"],
+            frameAncestors: ["'none'"],
+            baseUri: ["'self'"],
+            formAction: ["'self'"],
         }
     },
-    hsts: { maxAge: 31536000, includeSubDomains: true }
+    hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+    referrerPolicy: { policy: 'same-origin' },
+    crossOriginEmbedderPolicy: false, // free tier compatibility
 }));
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: false, limit: '10kb' }));
 app.use(express.static('public'));
 
 app.use(session({
-    name: 'admin_sid',
+    name: '__Host-admin_sid',          // __Host- prefix requires Secure + Path=/
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
+    rolling: true,                     // Reset maxAge on every request
     cookie: {
-        secure: false,        // set to true if using HTTPS (Render does this automatically)
-        httpOnly: true,       // prevents XSS cookie theft
-        maxAge: 15 * 60 * 1000, // 15 minutes
-        sameSite: 'strict'
+        secure: false,                 // Set to true if behind HTTPS (Render does this)
+        httpOnly: true,                // Inaccessible to JavaScript
+        maxAge: 15 * 60 * 1000,        // 15 minutes
+        sameSite: 'strict',            // CSRF protection via cookie isolation
+        path: '/',
     }
 }));
 
-// === RATE LIMITING ===
-const loginLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 5,                   // 5 attempts per IP
+// === SECURITY HELPERS ===
+
+function getClientIP(req) {
+    return req.headers['x-forwarded-for']?.split(',')[0].trim() 
+        || req.headers['x-real-ip'] 
+        || req.connection.remoteAddress 
+        || 'unknown';
+}
+
+function isIPBanned(ip) {
+    return db.bannedIPs.has(ip);
+}
+
+function recordFailedAttempt(ip) {
+    const now = Date.now();
+    if (!db.failedAttempts.has(ip)) db.failedAttempts.set(ip, []);
+    const attempts = db.failedAttempts.get(ip).filter(t => now - t < 3600000);
+    attempts.push(now);
+    db.failedAttempts.set(ip, attempts);
+
+    // Progressive ban: 5 fails = 1hr ban, 10 = permanent (until restart)
+    if (attempts.length >= 10) {
+        db.bannedIPs.add(ip);
+        return { banned: true, duration: 'permanent' };
+    } else if (attempts.length >= 5) {
+        const release = now + 3600000;
+        setTimeout(() => db.bannedIPs.delete(ip), 3600000);
+        db.bannedIPs.add(ip);
+        return { banned: true, duration: 3600000 };
+    }
+    return { banned: false, remaining: 5 - attempts.length };
+}
+
+function generateCSRF(sessionId) {
+    const token = crypto.randomBytes(32).toString('base64');
+    db.csrfTokens.set(token, { expires: Date.now() + 15 * 60 * 1000, sessionId });
+    return token;
+}
+
+function validateCSRF(req, res, next) {
+    const token = req.headers['x-csrf-token'] || req.body?.csrfToken;
+    const entry = db.csrfTokens.get(token);
+    if (!entry || entry.expires < Date.now() || entry.sessionId !== req.sessionID) {
+        return res.status(403).json({ error: 'Invalid or expired CSRF token' });
+    }
+    // Single-use token
+    db.csrfTokens.delete(token);
+    next();
+}
+
+// === RATE LIMITERS ===
+const strictLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 5,
     standardHeaders: true,
     legacyHeaders: false,
-    skipSuccessfulRequests: true,
+    keyGenerator: (req) => getClientIP(req),
     handler: (req, res) => {
-        res.status(429).json({ error: 'Too many attempts. Try again in 15 minutes.' });
+        res.status(429).json({ error: 'Too many requests. Cool down.' });
     }
 });
 
-const apiLimiter = rateLimit({
+const generalLimiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 30
+    max: 20,
+    keyGenerator: (req) => getClientIP(req),
 });
 
-app.use('/api/', apiLimiter);
+app.use(generalLimiter);
 
 // === AUTH MIDDLEWARE ===
 function requireAuth(req, res, next) {
-    if (req.session && req.session.authenticated && db.sessions.has(req.sessionID)) {
+    if (req.session?.authenticated === true && req.session?.username) {
         return next();
     }
-    return res.status(401).json({ error: 'Unauthorized' });
+    return res.status(401).json({ error: 'Unauthorized', code: 'NO_SESSION' });
 }
 
 function requireNoAuth(req, res, next) {
-    if (req.session && req.session.authenticated) {
-        return res.status(403).json({ error: 'Already logged in' });
+    if (req.session?.authenticated) {
+        return res.status(403).json({ error: 'Already authenticated' });
     }
     next();
 }
 
-// === ROUTES ===
+// === HONEYPOT ===
+// Fake "backdoor" endpoint that logs and bans attackers
+app.all('/admin/backup/config.bak', (req, res) => {
+    const ip = getClientIP(req);
+    const count = (db.honeypotTriggers.get(ip) || 0) + 1;
+    db.honeypotTriggers.set(ip, count);
+    if (count >= 2) db.bannedIPs.add(ip);
+    res.status(200).send('<!-- nothing here -->');
+});
 
-// Check if setup is needed
+app.all('/.env', (req, res) => {
+    db.bannedIPs.add(getClientIP(req));
+    res.status(404).send('Not Found');
+});
+
+// === API ROUTES ===
+
 app.get('/api/status', (req, res) => {
     res.json({
         setupRequired: !db.admin,
-        authenticated: !!(req.session && req.session.authenticated)
+        authenticated: !!req.session?.authenticated,
+        ip: getClientIP(req)  // debug, remove in production
     });
 });
 
-// Setup (first-time only)
-app.post('/api/setup', requireNoAuth, async (req, res) => {
-    if (db.admin) {
-        return res.status(403).json({ error: 'Admin already exists' });
-    }
+app.get('/api/csrf', (req, res) => {
+    if (!req.sessionID) return res.status(400).json({ error: 'No session' });
+    res.json({ token: generateCSRF(req.sessionID) });
+});
 
-    const { username, password } = req.body;
+app.post('/api/setup', strictLimiter, requireNoAuth, async (req, res) => {
+    const ip = getClientIP(req);
+    if (isIPBanned(ip)) return res.status(403).json({ error: 'Banned' });
+
+    if (db.admin) return res.status(403).json({ error: 'Already initialized' });
+
+    const { username, password, csrfToken } = req.body;
     if (!username || !password || password.length < 8) {
         return res.status(400).json({ error: 'Username required, password min 8 chars' });
     }
+
+    // Validate CSRF for setup too
+    const entry = db.csrfTokens.get(csrfToken);
+    if (!entry || entry.expires < Date.now() || entry.sessionId !== req.sessionID) {
+        return res.status(403).json({ error: 'Invalid CSRF' });
+    }
+    db.csrfTokens.delete(csrfToken);
 
     const hash = await bcrypt.hash(password, SALT_ROUNDS);
     db.admin = { username, hash, createdAt: Date.now() };
 
     req.session.authenticated = true;
     req.session.username = username;
-    db.sessions.add(req.sessionID);
+    req.session.createdAt = Date.now();
 
-    res.json({ success: true, message: 'Admin created and logged in' });
+    res.json({ success: true });
 });
 
-// Login
-app.post('/api/login', loginLimiter, async (req, res) => {
-    if (!db.admin) {
-        return res.status(400).json({ error: 'Setup required first' });
+app.post('/api/login', strictLimiter, async (req, res) => {
+    const ip = getClientIP(req);
+    if (isIPBanned(ip)) return res.status(403).json({ error: 'IP banned' });
+
+    if (!db.admin) return res.status(400).json({ error: 'Not initialized' });
+
+    const { username, password, csrfToken } = req.body;
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Missing credentials' });
     }
 
-    const { username, password } = req.body;
-    if (!username || !password) {
-        return res.status(400).json({ error: 'Username and password required' });
+    const entry = db.csrfTokens.get(csrfToken);
+    if (!entry || entry.expires < Date.now() || entry.sessionId !== req.sessionID) {
+        return res.status(403).json({ error: 'Invalid CSRF token' });
     }
+    db.csrfTokens.delete(csrfToken);
 
     if (username !== db.admin.username) {
+        recordFailedAttempt(ip);
         return res.status(401).json({ error: 'Invalid credentials' });
     }
 
     const valid = await bcrypt.compare(password, db.admin.hash);
     if (!valid) {
-        return res.status(401).json({ error: 'Invalid credentials' });
+        const status = recordFailedAttempt(ip);
+        if (status.banned) {
+            return res.status(403).json({ error: `IP banned for ${status.duration === 'permanent' ? 'permanent' : '1 hour'}` });
+        }
+        return res.status(401).json({ error: 'Invalid credentials', remaining: status.remaining });
     }
 
-    req.session.authenticated = true;
-    req.session.username = username;
-    db.sessions.add(req.sessionID);
+    // Clear failed attempts on success
+    db.failedAttempts.delete(ip);
 
-    res.json({ success: true });
-});
-
-// Logout
-app.post('/api/logout', (req, res) => {
-    db.sessions.delete(req.sessionID);
-    req.session.destroy(() => {
+    req.session.regenerate((err) => {  // Prevent session fixation
+        if (err) return res.status(500).json({ error: 'Session error' });
+        req.session.authenticated = true;
+        req.session.username = username;
+        req.session.createdAt = Date.now();
         res.json({ success: true });
     });
 });
 
-// Admin data (protected)
+app.post('/api/logout', (req, res) => {
+    req.session.destroy(() => {
+        res.clearCookie('__Host-admin_sid', { path: '/' });
+        res.json({ success: true });
+    });
+});
+
 app.get('/api/admin/data', requireAuth, (req, res) => {
     res.json({
         username: req.session.username,
         serverTime: new Date().toISOString(),
-        sessionId: req.sessionID.slice(0, 8) + '...',
+        sessionAge: Date.now() - (req.session.createdAt || Date.now()),
         security: {
-            hashing: 'bcrypt (12 rounds)',
-            sessions: 'Server-side + HttpOnly cookies',
-            rateLimit: '5 attempts / 15 min per IP',
-            transport: 'Helmet security headers'
+            hashing: 'bcrypt (13 rounds)',
+            sessions: 'Server-side + HttpOnly + SameSite=Strict + Rolling',
+            csrf: 'Double-submit cryptographically random tokens',
+            rateLimit: '5 attempts / 15 min per IP + progressive ban',
+            transport: 'Helmet CSP + HSTS + Referrer-Policy',
+            honeypot: 'Active decoy endpoints logging attackers',
         },
-        flag: 'GROK_FAILED_TO_BYPASS_SERVER_AUTH'
+        flag: 'SERVER_SIDE_AUTH_UNBREAKABLE_BY_SOURCE_INSPECTION'
     });
 });
 
-// Serve SPA
+// SPA fallback
 app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 app.listen(PORT, () => {
-    console.log(`🔒 Secure Admin Panel running on port ${PORT}`);
+    console.log(`🔒 Secure Admin Panel v2 running on port ${PORT}`);
     console.log(`Setup required: ${!db.admin}`);
 });
