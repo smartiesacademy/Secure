@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex, nofollow">
+<title>Secure Admin Panel</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0c0c1d,#1a1a2e,#0f3460);color:#e0e0e0;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px}
+.panel{background:rgba(255,255,255,0.06);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:24px;padding:40px;width:100%;max-width:480px;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
+.panel-wide{max-width:860px}
+h1{text-align:center;font-size:28px;margin-bottom:6px;font-weight:700}
+.subtitle{text-align:center;opacity:0.5;font-size:14px;margin-bottom:28px}
+input{width:100%;padding:14px 16px;margin:8px 0;border:1px solid rgba(255,255,255,0.15);border-radius:12px;background:rgba(0,0,0,0.3);color:#fff;font-size:15px;transition:all 0.2s}
+input:focus{outline:none;border-color:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,0.2)}
+button{width:100%;padding:14px;margin-top:16px;border:none;border-radius:12px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;font-size:16px;font-weight:600;cursor:pointer;transition:all 0.2s}
+button:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 8px 25px rgba(99,102,241,0.4)}
+button:disabled{opacity:0.4;cursor:not-allowed}
+.error{color:#f87171;margin-top:14px;text-align:center;font-size:14px;min-height:20px}
+.success{color:#34d399;margin-top:14px;text-align:center;font-size:14px}
+.info{color:#60a5fa;margin-top:10px;text-align:center;font-size:13px}
+.spinner{width:20px;height:20px;border:2px solid rgba(255,255,255,0.2);border-top-color:#fff;border-radius:50%;animation:spin 1s linear infinite;display:inline-block;margin-left:8px;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+.card{background:rgba(255,255,255,0.04);border-radius:16px;padding:24px;margin-bottom:16px;border:1px solid rgba(255,255,255,0.08)}
+.card h3{font-size:15px;margin-bottom:10px;color:#a78bfa;font-weight:600}
+.card p{opacity:0.85;font-size:14px;line-height:1.6;margin:6px 0}
+.badge{display:inline-block;padding:4px 10px;border-radius:20px;font-size:11px;font-weight:600;margin:3px}
+.badge-green{background:rgba(52,211,153,0.12);color:#34d399;border:1px solid rgba(52,211,153,0.25)}
+.badge-blue{background:rgba(96,165,250,0.12);color:#60a5fa;border:1px solid rgba(96,165,250,0.25)}
+.badge-red{background:rgba(248,113,113,0.12);color:#f87171;border:1px solid rgba(248,113,113,0.25)}
+.badge-purple{background:rgba(167,139,250,0.12);color:#a78bfa;border:1px solid rgba(167,139,250,0.25)}
+.logout-btn{width:auto;padding:8px 18px;margin:0;font-size:13px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15)}
+.logout-btn:hover{background:rgba(255,255,255,0.15)}
+.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:28px;flex-wrap:wrap;gap:12px}
+.header h1{margin:0;text-align:left;font-size:22px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
+.grid-item{background:rgba(0,0,0,0.2);padding:12px;border-radius:10px;font-size:12px}
+.grid-item strong{display:block;margin-bottom:4px;color:#e2e8f0;font-size:13px}
+#app{min-height:400px;width:100%;display:flex;justify-content:center;align-items:center}
+.noscript{text-align:center;padding:20px}
+.noscript h2{color:#fbbf24;margin-bottom:10px}
+</style>
+</head>
+<body>
+<div id="app">
+    <div class="panel" id="loading-panel">
+        <h1>🔐 Secure Admin</h1>
+        <p class="subtitle">Loading secure session...</p>
+        <div style="text-align:center;margin:20px 0">
+            <div class="spinner" style="width:40px;height:40px;border-width:3px"></div>
+        </div>
+        <noscript>
+            <div class="noscript">
+                <h2>⚠️ JavaScript Required</h2>
+                <p>This admin panel requires JavaScript to authenticate securely.</p>
+            </div>
+        </noscript>
+    </div>
+</div>
+
+<script>
+(function() {
+    'use strict';
+
+    const API = '/api';
+    let currentCSRF = null;
+
+    // === API CLIENT ===
+    async function api(path, opts) {
+        opts = opts || {};
+        const headers = { 'Content-Type': 'application/json' };
+        if (currentCSRF) headers['X-CSRF-Token'] = currentCSRF;
+
+        try {
+            const res = await fetch(API + path, {
+                credentials: 'include',
+                headers: headers,
+                method: opts.method || 'GET',
+                body: opts.body ? JSON.stringify(opts.body) : undefined
+            });
+
+            if (res.status === 403) {
+                const errData = await res.json().catch(function() { return {}; });
+                if (errData.error && errData.error.indexOf('CSRF') !== -1) {
+                    await fetchCSRF();
+                    if (currentCSRF) headers['X-CSRF-Token'] = currentCSRF;
+                    const retry = await fetch(API + path, {
+                        credentials: 'include',
+                        headers: headers,
+                        method: opts.method || 'GET',
+                        body: opts.body ? JSON.stringify(opts.body) : undefined
+                    });
+                    const data = await retry.json().catch(function() { return {}; });
+                    return { ok: retry.ok, status: retry.status, data: data };
+                }
+            }
+
+            const data = await res.json().catch(function() { return {}; });
+            return { ok: res.ok, status: res.status, data: data };
+        } catch (e) {
+            console.error('API Error:', e);
+            return { ok: false, status: 0, data: { error: 'Network error. Is the server running?' } };
+        }
+    }
+
+    async function fetchCSRF() {
+        try {
+            const r = await fetch(API + '/csrf', { credentials: 'include' });
+            if (r.ok) {
+                const d = await r.json();
+                currentCSRF = d.token;
+            }
+        } catch (e) {
+            console.error('CSRF fetch failed:', e);
+        }
+    }
+
+    // === UI HELPERS ===
+    function setPanel(html, wide) {
+        const app = document.getElementById('app');
+        app.innerHTML = '<div class="panel ' + (wide ? 'panel-wide' : '') + '">' + html + '</div>';
+    }
+
+    // === VIEWS ===
+
+    async function setupView() {
+        await fetchCSRF();
+        setPanel(
+            '<h1>🔐 First-Time Setup</h1>' +
+            '<p class="subtitle">Server-side bcrypt hashing. No client secrets.</p>' +
+            '<input type="text" id="su-user" placeholder="Username" value="admin" autocomplete="off">' +
+            '<input type="password" id="su-pass" placeholder="Password (min 8 chars)" autocomplete="new-password">' +
+            '<input type="password" id="su-confirm" placeholder="Confirm password" autocomplete="new-password">' +
+            '<button id="su-btn">Initialize Panel</button>' +
+            '<p class="error" id="su-err"></p>'
+        );
+
+        document.getElementById('su-btn').addEventListener('click', async function() {
+            const u = document.getElementById('su-user').value.trim();
+            const p = document.getElementById('su-pass').value;
+            const c = document.getElementById('su-confirm').value;
+            const err = document.getElementById('su-err');
+            const btn = document.getElementById('su-btn');
+
+            if (p.length < 8) { err.textContent = 'Password must be at least 8 characters'; return; }
+            if (p !== c) { err.textContent = 'Passwords do not match'; return; }
+            if (!currentCSRF) { err.textContent = 'CSRF token missing. Refresh page.'; return; }
+
+            btn.disabled = true;
+            btn.innerHTML = 'Initializing...<span class="spinner"></span>';
+
+            const r = await api('/setup', { method: 'POST', body: { username: u, password: p, csrfToken: currentCSRF } });
+
+            if (r.ok) {
+                err.className = 'success';
+                err.textContent = 'Success! Redirecting...';
+                setTimeout(function() { location.reload(); }, 800);
+            } else {
+                btn.disabled = false;
+                btn.textContent = 'Initialize Panel';
+                err.textContent = (r.data && r.data.error) ? r.data.error : 'Setup failed';
+                await fetchCSRF();
+            }
+        });
+
+        document.getElementById('su-confirm').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') document.getElementById('su-btn').click();
+        });
+    }
+
+    async function loginView() {
+        await fetchCSRF();
+        setPanel(
+            '<h1>🔒 Admin Login</h1>' +
+            '<p class="subtitle">Credentials verified server-side. Source code is useless.</p>' +
+            '<input type="text" id="li-user" placeholder="Username" value="admin" autocomplete="off">' +
+            '<input type="password" id="li-pass" placeholder="Password" autocomplete="current-password">' +
+            '<button id="li-btn">Authenticate</button>' +
+            '<p class="error" id="li-err"></p>' +
+            '<p class="info" id="li-info"></p>'
+        );
+
+        const btn = document.getElementById('li-btn');
+        btn.addEventListener('click', async function() {
+            const u = document.getElementById('li-user').value.trim();
+            const p = document.getElementById('li-pass').value;
+            const err = document.getElementById('li-err');
+            const info = document.getElementById('li-info');
+
+            if (!p) { err.textContent = 'Enter password'; return; }
+            if (!currentCSRF) { err.textContent = 'CSRF missing. Refresh page.'; return; }
+
+            btn.disabled = true;
+            btn.innerHTML = 'Authenticating...<span class="spinner"></span>';
+            err.textContent = '';
+            info.textContent = '';
+
+            const r = await api('/login', { method: 'POST', body: { username: u, password: p, csrfToken: currentCSRF } });
+
+            if (r.ok) {
+                err.className = 'success';
+                err.textContent = 'Authenticated! Loading...';
+                setTimeout(function() { location.reload(); }, 600);
+            } else {
+                btn.disabled = false;
+                btn.textContent = 'Authenticate';
+                err.textContent = (r.data && r.data.error) ? r.data.error : 'Authentication failed';
+                if (r.data && r.data.remaining !== undefined) {
+                    info.textContent = r.data.remaining + ' attempts remaining before lockout';
+                } else if (r.data && r.data.error && r.data.error.indexOf('banned') !== -1) {
+                    info.textContent = 'Your IP has been banned due to repeated failures.';
+                }
+                await fetchCSRF();
+            }
+        });
+
+        document.getElementById('li-pass').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') btn.click();
+        });
+    }
+
+    async function dashboardView() {
+        const r = await api('/admin/data');
+        if (!r.ok) { loginView(); return; }
+        const d = r.data;
+
+        setPanel(
+            '<div class="header">' +
+                '<div>' +
+                    '<h1>📊 Secure Dashboard</h1>' +
+                    '<p style="opacity:0.5;font-size:13px;margin-top:4px">Server-Side Auth v3.0</p>' +
+                '</div>' +
+                '<button class="logout-btn" id="lo-btn">🔒 Lock</button>' +
+            '</div>' +
+
+            '<div class="card">' +
+                '<h3>🏁 Challenge Status</h3>' +
+                '<p style="font-size:20px;font-weight:700;color:#fbbf24;margin:8px 0">' + d.flag + '</p>' +
+                '<p style="opacity:0.6;font-size:12px">Session active · Server time: ' + new Date(d.serverTime).toLocaleTimeString() + '</p>' +
+            '</div>' +
+
+            '<div class="card">' +
+                '<h3>🛡️ Why Source Code Inspection Fails Here</h3>' +
+                '<p>Your previous panel stored the password in the browser as an ASCII array. Grok decoded it instantly because <strong>the secret was in the code</strong>.</p>' +
+                '<p style="margin-top:8px">This panel sends credentials to a server. The server stores only a <strong>bcrypt hash</strong> (irreversible). The session cookie is <strong>HttpOnly</strong> — JavaScript cannot read it. Even with full source code access, Grok cannot extract the hash or forge a session.</p>' +
+            '</div>' +
+
+            '<div class="card">' +
+                '<h3>🔐 Active Defense Layers</h3>' +
+                '<div class="grid">' +
+                    '<div class="grid-item"><strong>Password Hashing</strong>' + d.security.hashing + '</div>' +
+                    '<div class="grid-item"><strong>Sessions</strong>' + d.security.sessions + '</div>' +
+                    '<div class="grid-item"><strong>CSRF Protection</strong>' + d.security.csrf + '</div>' +
+                    '<div class="grid-item"><strong>Rate Limiting</strong>' + d.security.rateLimit + '</div>' +
+                    '<div class="grid-item"><strong>Transport</strong>' + d.security.transport + '</div>' +
+                    '<div class="grid-item"><strong>Honeypots</strong>' + d.security.honeypot + '</div>' +
+                '</div>' +
+                '<div style="margin-top:14px">' +
+                    '<span class="badge badge-green">No client secrets</span>' +
+                    '<span class="badge badge-green">HttpOnly cookies</span>' +
+                    '<span class="badge badge-blue">CSRF tokens</span>' +
+                    '<span class="badge badge-purple">Honeypot traps</span>' +
+                    '<span class="badge badge-red">IP progressive ban</span>' +
+                '</div>' +
+            '</div>' +
+
+            '<div class="card">' +
+                '<h3>⚠️ The Only Attack Vectors</h3>' +
+                '<p>1. <strong>Brute force:</strong> Rate-limited to 5 attempts per 15 minutes. 10 fails = IP ban.</p>' +
+                '<p>2. <strong>Session hijack:</strong> Cookie is HttpOnly + SameSite=Strict + rolling expiry.</p>' +
+                '<p>3. <strong>Server compromise:</strong> You do not control the server infrastructure.</p>' +
+                '<p style="margin-top:8px;opacity:0.6">Even with the entire source code, there is no password to decode. The hash is on the server.</p>' +
+            '</div>',
+            true
+        );
+
+        document.getElementById('lo-btn').addEventListener('click', async function() {
+            await api('/logout', { method: 'POST' });
+            location.reload();
+        });
+    }
+
+    // === INIT ===
+    async function init() {
+        console.log('Initializing admin panel...');
+        const r = await api('/status');
+        console.log('Status response:', r);
+
+        if (!r.ok) {
+            setPanel(
+                '<h1>⚠️ Server Error</h1>' +
+                '<p class="subtitle">Cannot reach the authentication server.</p>' +
+                '<div class="card">' +
+                    '<p><strong>Error:</strong> ' + ((r.data && r.data.error) ? r.data.error : 'Unknown error') + '</p>' +
+                    '<p style="margin-top:8px">Make sure the Node.js server is running and you are accessing this page through the server (not opening the HTML file directly).</p>' +
+                    '<p style="margin-top:8px;opacity:0.6">If running locally: <code>node server.js</code> then visit <code>http://localhost:3000</code></p>' +
+                '</div>'
+            );
+            return;
+        }
+
+        if (r.data.setupRequired) {
+            setupView();
+        } else if (r.data.authenticated) {
+            dashboardView();
+        } else {
+            loginView();
+        }
+    }
+
+    // Start immediately when DOM is ready
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+})();
+</script>
+</body>
+</html>
