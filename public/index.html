@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Secure Admin Panel</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);color:#fff;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px}
+.container{background:rgba(255,255,255,0.05);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,0.1);border-radius:20px;padding:40px;width:100%;max-width:460px;box-shadow:0 8px 32px rgba(0,0,0,0.4)}
+h1{margin-bottom:8px;text-align:center;font-size:28px}
+.subtitle{text-align:center;opacity:0.7;margin-bottom:28px;font-size:14px}
+input{width:100%;padding:14px 16px;margin:8px 0;border:1px solid rgba(255,255,255,0.15);border-radius:10px;background:rgba(0,0,0,0.25);color:#fff;font-size:15px}
+input:focus{outline:none;border-color:#667eea}
+button{width:100%;padding:14px;margin-top:16px;border:none;border-radius:10px;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;font-size:16px;font-weight:600;cursor:pointer;transition:all 0.2s}
+button:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 4px 20px rgba(102,126,234,0.4)}
+button:disabled{opacity:0.5;cursor:not-allowed}
+.error{color:#ff6b6b;margin-top:14px;text-align:center;font-size:14px}
+.success{color:#00b894;margin-top:14px;text-align:center;font-size:14px}
+.hidden{display:none !important}
+.card{background:rgba(255,255,255,0.04);border-radius:14px;padding:24px;margin-bottom:16px;border:1px solid rgba(255,255,255,0.08)}
+.card h3{font-size:16px;margin-bottom:12px;color:#a29bfe}
+.card p{opacity:0.85;font-size:14px;line-height:1.6;margin:4px 0}
+.badge{display:inline-block;padding:4px 10px;border-radius:20px;font-size:12px;font-weight:600;margin-right:6px;margin-bottom:6px}
+.badge-green{background:rgba(0,184,148,0.15);color:#00b894;border:1px solid rgba(0,184,148,0.3)}
+.badge-blue{background:rgba(116,185,255,0.15);color:#74b9ff;border:1px solid rgba(116,185,255,0.3)}
+.logout-btn{width:auto;padding:8px 20px;margin:0;font-size:13px;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.2)}
+.panel-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:28px;flex-wrap:wrap;gap:12px}
+</style>
+</head>
+<body>
+<div id="app">
+    <div class="container" id="loading">
+        <h1>🔐 Loading</h1>
+        <p class="subtitle">Checking authentication status...</p>
+    </div>
+</div>
+
+<script>
+const API = '/api';
+
+async function api(path, opts={}) {
+    const res = await fetch(API + path, {
+        headers: { 'Content-Type': 'application/json' },
+        ...opts,
+        body: opts.body ? JSON.stringify(opts.body) : undefined
+    });
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, data };
+}
+
+function render(html) {
+    document.getElementById('app').innerHTML = `<div class="container">${html}</div>`;
+}
+
+function renderPanel(html) {
+    document.getElementById('app').innerHTML = `<div class="container" style="max-width:850px">${html}</div>`;
+}
+
+// === VIEWS ===
+
+function setupView() {
+    render(`
+        <h1>🔐 First-Time Setup</h1>
+        <p class="subtitle">Server-side bcrypt hashing. No client-side secrets.</p>
+        <input type="text" id="su-user" placeholder="Username" value="admin">
+        <input type="password" id="su-pass" placeholder="Password (min 8 chars)">
+        <input type="password" id="su-confirm" placeholder="Confirm password">
+        <button id="su-btn">Create Admin</button>
+        <p class="error" id="su-err"></p>
+    `);
+    document.getElementById('su-btn').onclick = async () => {
+        const u = document.getElementById('su-user').value;
+        const p = document.getElementById('su-pass').value;
+        const c = document.getElementById('su-confirm').value;
+        const err = document.getElementById('su-err');
+        if (p.length < 8) { err.textContent = 'Min 8 chars'; return; }
+        if (p !== c) { err.textContent = 'Passwords mismatch'; return; }
+        const r = await api('/setup', { method: 'POST', body: { username: u, password: p } });
+        if (r.ok) location.reload();
+        else err.textContent = r.data.error || 'Setup failed';
+    };
+}
+
+function loginView() {
+    render(`
+        <h1>🔒 Admin Login</h1>
+        <p class="subtitle">Server-side sessions. Source code won't help.</p>
+        <input type="text" id="li-user" placeholder="Username" value="admin">
+        <input type="password" id="li-pass" placeholder="Password">
+        <button id="li-btn">Authenticate</button>
+        <p class="error" id="li-err"></p>
+    `);
+    document.getElementById('li-btn').onclick = async () => {
+        const u = document.getElementById('li-user').value;
+        const p = document.getElementById('li-pass').value;
+        const err = document.getElementById('li-err');
+        const btn = document.getElementById('li-btn');
+        btn.disabled = true;
+        const r = await api('/login', { method: 'POST', body: { username: u, password: p } });
+        btn.disabled = false;
+        if (r.ok) location.reload();
+        else err.textContent = r.data.error || 'Login failed';
+    };
+    document.getElementById('li-pass').addEventListener('keypress', e => {
+        if (e.key === 'Enter') document.getElementById('li-btn').click();
+    });
+}
+
+async function dashboardView() {
+    const r = await api('/admin/data');
+    if (!r.ok) { loginView(); return; }
+    const d = r.data;
+    renderPanel(`
+        <div class="panel-header">
+            <div>
+                <h1>📊 Secure Dashboard</h1>
+                <p style="opacity:0.6;font-size:13px;margin-top:4px">Server-Side Auth v1.0</p>
+            </div>
+            <button class="logout-btn" id="lo-btn">🔒 Lock</button>
+        </div>
+        <div class="card">
+            <h3>🔐 Why This Is Different</h3>
+            <p>Your previous panel failed because <strong>the browser is the execution environment</strong>. 
+            Anyone with DevTools owns the code. This panel moves all secrets to the server.</p>
+            <p style="margin-top:8px"><strong>What the attacker sees:</strong> HTML, CSS, and fetch() calls. 
+            <strong>What they cannot see:</strong> The bcrypt hash, the session secret, or the database.</p>
+        </div>
+        <div class="card">
+            <h3>🛡️ Active Security</h3>
+            <p><span class="badge badge-green">${d.security.hashing}</span></p>
+            <p><span class="badge badge-blue">${d.security.sessions}</span></p>
+            <p><span class="badge badge-blue">${d.security.rateLimit}</span></p>
+            <p><span class="badge badge-green">${d.security.transport}</span></p>
+        </div>
+        <div class="card">
+            <h3>🏁 Challenge Status</h3>
+            <p style="font-size:18px;font-weight:700;color:#fdcb6e">${d.flag}</p>
+            <p style="margin-top:8px">Session: <code>${d.sessionId}</code></p>
+            <p>Server Time: ${d.serverTime}</p>
+        </div>
+    `);
+    document.getElementById('lo-btn').onclick = async () => {
+        await api('/logout', { method: 'POST' });
+        location.reload();
+    };
+}
+
+// === INIT ===
+async function init() {
+    const r = await api('/status');
+    if (r.data.setupRequired) setupView();
+    else if (r.data.authenticated) dashboardView();
+    else loginView();
+}
+init();
+</script>
+</body>
+</html>
